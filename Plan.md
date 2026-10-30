@@ -7,12 +7,12 @@ Make Horizon C usable without any Microsoft/Xbox account integration. Offline pr
 ## Status
 
 - [x] Planning
-- [ ] Audit the repository for Microsoft/Xbox sign-in, OAuth/Azure configuration, account/session/token handling, Microsoft-specific UI, endpoints, tests, and documentation
-- [ ] Replace account management with local offline profiles only
-- [ ] Remove Microsoft/Xbox authentication and account-related dependencies and configuration
-- [ ] Ensure game preparation uses locally supplied, legally obtained files only; remove Microsoft-account-gated downloads
-- [ ] Add a first-launch disclaimer with an unchecked acknowledgement and Exit / Accept & Continue actions
-- [ ] Update documentation, settings, CLI commands, and tests to match offline-only behavior
+- [x] Audit the repository for Microsoft/Xbox sign-in, OAuth/Azure configuration, account/session/token handling, Microsoft-specific UI, endpoints, tests, and documentation
+- [x] Replace account management with local offline profiles only
+- [x] Remove Microsoft/Xbox authentication and account-related dependencies and configuration
+- [x] Ensure game preparation uses locally supplied, legally obtained files only; remove Microsoft-account-gated downloads
+- [x] Add a first-launch disclaimer with an unchecked acknowledgement and Exit / Accept & Continue actions
+- [x] Update documentation, settings, CLI commands, and tests to match offline-only behavior
 - [ ] Run formatting, tests, and available CI checks; fix regressions
 
 ## Requirements

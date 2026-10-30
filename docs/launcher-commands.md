@@ -36,18 +36,18 @@ MCP: `remove`, needs `confirm: true`.
 
 ## `horizon-launcher prepare`
 
-Prepare a version's resources from your own Minecraft install, or from Mojang.
+Prepare a version using files from a local Minecraft installation.
 
     horizon-launcher prepare
 
 - `--minecraft`: The game folder of the official launcher, Prism Launcher, MultiMC, the Modrinth App, ATLauncher or GDLauncher (default: the launcher's, then every launcher's default)
-- `--download`: Download Minecraft from Mojang for the signed-in account that owns it, instead of using an install
+- `--server-jar`: Import the version's server jar from your legally obtained Minecraft installation
 
 MCP: `prepare`.
 
 ## `horizon-launcher play`
 
-Start the client (needs a signed-in Microsoft account that owns Minecraft: Java Edition).
+Start the client under the selected local offline profile using imported game files.
 
     horizon-launcher play
 
@@ -101,76 +101,58 @@ Show the Discord, sponsor and website links.
 
 MCP: `links`.
 
-## `horizon-launcher account list`
+## `horizon-launcher profile list`
 
-The signed-in accounts and which one plays.
+List saved local offline profiles and the selected profile.
 
-    horizon-launcher account list
+    horizon-launcher profile list
 
-MCP: `account_list`.
+MCP: `profile_list`.
 
-## `horizon-launcher account sign-in`
+## `horizon-launcher profile select`
 
-Sign in with a Microsoft account in your browser (device code). Play needs one that owns Minecraft: Java Edition.
+Select a saved local offline profile.
 
-    horizon-launcher account sign-in
+    horizon-launcher profile select <WHO>
 
-MCP: `account_sign_in`.
+- `WHO`: A saved offline username
 
-## `horizon-launcher account sign-out`
+MCP: `profile_select`.
 
-Sign out: the account's tokens leave the keychain.
+## `horizon-launcher profile offline`
 
-    horizon-launcher account sign-out <WHO>
+Add and select an offline username, or use the game's generated name when NAME is omitted.
 
-- `WHO`: Its name or UUID
+    horizon-launcher profile offline [NAME]
 
-MCP: `account_sign_out`, needs `confirm: true`.
+- `NAME`: 3 to 16 ASCII letters, digits or underscores
 
-## `horizon-launcher account select`
+MCP: `profile_offline`.
 
-Play as this account, or as one of your offline names.
+## `horizon-launcher profile forget-offline`
 
-    horizon-launcher account select <WHO>
+Forget a local offline profile, including its saved skin and cape.
 
-- `WHO`
+    horizon-launcher profile forget-offline <NAME>
 
-MCP: `account_select`.
+- `NAME`: The saved offline username
 
-## `horizon-launcher account offline`
+MCP: `profile_forget_offline`.
 
-Play offline (LAN, offline-mode servers) beside a signed-in account that owns the game: as NAME (kept to switch back to; 3 to 16 letters, digits or _), or as the name the game made up.
+## `horizon-launcher profile skin`
 
-    horizon-launcher account offline [NAME]
+Set or inspect a local profile's skin and cape.
 
-- `NAME`
+    horizon-launcher profile skin <NAME> [FILE]
 
-MCP: `account_offline`.
-
-## `horizon-launcher account forget-offline`
-
-Forget one of your offline names; its skin and cape go with it.
-
-    horizon-launcher account forget-offline <NAME>
-
-- `NAME`
-
-MCP: `account_forget_offline`.
-
-## `horizon-launcher account skin`
-
-Show or set an offline name's skin and cape: a 64x64 (or 64x32) skin PNG, a 64x32 cape PNG, the model. Kept by the launcher and given to the game when that name plays.
-
-    horizon-launcher account skin <NAME> [FILE]
-
-- `NAME`
-- `FILE`: The skin's PNG
+- `NAME`: The saved offline username
+- `FILE`: A skin PNG
 - `--model`: classic or slim arms
-- `--cape`: The cape's PNG
+- `--cape`: A cape PNG
 - `--no-skin`: Back to the default skin
 - `--no-cape`: Take the cape off
 
-MCP: `account_skin`.
+MCP: `profile_skin`.
 
 ## `horizon-launcher settings`
 

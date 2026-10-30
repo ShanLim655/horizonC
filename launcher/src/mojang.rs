@@ -1,14 +1,8 @@
-//! The player's own download of the pinned version from Mojang, for a signed-in account that
-//! owns Minecraft: Java Edition (#434), as other launchers get it: the version JSON, the client
-//! jar, this system's libraries and the assets (the sounds), each checked against its sha1,
-//! in the official launcher's layout in the launcher's data folder. sources.rs then finds them
-//! there like any launcher's. Nothing of Mojang's is part of Horizon.
-//!
-//! Each file is checked against the size and sha1 Mojang lists, and written whole. A download
-//! stopped half way (cancelled, no network) keeps the files it finished: the next one fetches
-//! only the rest.
+//! Optional Java runtime installation. Minecraft client jars, libraries and assets are imported
+//! from the player's existing installation; this module only installs Java when a compatible
+//! runtime is not already available.
 
-use crate::sources::{fetch_checked, fetch_manifest, sha1_file, sha1_hex, write_file, Fetch, Pins};
+use crate::sources::{fetch_checked, sha1_file, sha1_hex, write_file, Fetch};
 use serde_json::Value;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -16,7 +10,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const OBJECTS: &str = "https://resources.download.minecraft.net";
 /// The index of Mojang's Java runtimes, the one the official launcher reads.
 const JAVA_RUNTIMES: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 
@@ -40,99 +33,6 @@ struct File {
     sha1: String,
     size: Option<u64>,
     path: PathBuf,
-}
-
-/// Downloads the pinned version into `dir`, `jobs` files at a time; files already there and
-/// whole are kept. An asset that fails is a line in the log (the game is then partly silent),
-/// anything else an error. `cancel` stops it between files.
-pub fn download(
-    pins: &Pins,
-    dir: &Path,
-    os: &str,
-    jobs: usize,
-    fetch: Fetch,
-    cancel: &AtomicBool,
-    log: &dyn Fn(String),
-) -> Result<(), String> {
-    let v = &pins.version;
-    let versions = dir.join("versions").join(v);
-    let manifest = versions.join(format!("{v}.json"));
-    fetch_manifest(pins, &manifest, fetch, log)?;
-    let manifest = read_json(&manifest)?;
-    let client = &manifest["downloads"]["client"];
-    // A version Horizon doesn't pin takes its client's sha1 from its version file, itself
-    // checked against the sha1 Mojang's version list gives (`Pins::for_version`).
-    let client_sha1 = match pins.client_sha1.as_str() {
-        "" => text(client, "sha1")?,
-        pinned => pinned.to_string(),
-    };
-    let mut game = vec![File {
-        url: text(client, "url")?,
-        sha1: client_sha1,
-        size: client["size"].as_u64(),
-        path: versions.join(format!("{v}.jar")),
-    }];
-    let libraries = manifest["libraries"]
-        .as_array()
-        .ok_or("The version file has no libraries")?;
-    for library in libraries.iter().filter(|l| allowed(l, os)) {
-        // Before 1.19 a library's natives for this system are a classifier of its own.
-        let native = native_classifier(library, os)
-            .map(|key| &library["downloads"]["classifiers"][key.as_str()]);
-        for artifact in [Some(&library["downloads"]["artifact"]), native]
-            .into_iter()
-            .flatten()
-            .filter(|a| !a.is_null())
-        {
-            game.push(File {
-                url: text(artifact, "url")?,
-                sha1: text(artifact, "sha1")?,
-                size: artifact["size"].as_u64(),
-                path: dir
-                    .join("libraries")
-                    .join(relative(&text(artifact, "path")?)?),
-            });
-        }
-    }
-    let libraries = game.len() - 1;
-    // The logging setup the game is started with (`logging.client.argument`): for 1.7 to 1.18,
-    // Mojang's fixed one is what keeps Log4Shell out.
-    let logging = &manifest["logging"]["client"]["file"];
-    if !logging.is_null() {
-        game.push(File {
-            url: text(logging, "url")?,
-            sha1: text(logging, "sha1")?,
-            size: logging["size"].as_u64(),
-            path: dir
-                .join("assets/log_configs")
-                .join(relative(&text(logging, "id")?)?),
-        });
-    }
-    log(format!(
-        "Downloading Minecraft {v} from Mojang: the game and {libraries} libraries"
-    ));
-    fetch_all(&game, jobs, fetch, cancel, log)?;
-    let index = &manifest["assetIndex"];
-    let index = File {
-        url: text(index, "url")?,
-        sha1: text(index, "sha1")?,
-        size: index["size"].as_u64(),
-        path: dir
-            .join("assets/indexes")
-            .join(relative(&format!("{}.json", text(index, "id")?))?),
-    };
-    let assets = fetch_all(std::slice::from_ref(&index), 1, fetch, cancel, log)
-        .and_then(|_| objects(&read_json(&index.path)?, dir))
-        .and_then(|objects| {
-            log(format!("Downloading the sounds ({} files)", objects.len()));
-            fetch_all(&objects, jobs, fetch, cancel, log)
-        });
-    match assets {
-        Err(e) if e == CANCELLED => return Err(e),
-        Err(e) => log(format!("The sounds could not all be downloaded: {e}")),
-        Ok(()) => {}
-    }
-    Ok(())
 }
 
 /// Mojang's name for this system in its Java runtime index.
@@ -255,11 +155,6 @@ fn link_stays_inside(link: &Path, target: &str) -> bool {
     true
 }
 
-fn read_json(path: &Path) -> Result<Value, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
-}
-
 fn text(v: &Value, key: &str) -> Result<String, String> {
     v[key]
         .as_str()
@@ -275,63 +170,6 @@ pub(crate) fn relative(path: &str) -> Result<PathBuf, String> {
             .all(|c| matches!(c, Component::Normal(_)));
     safe.then(|| PathBuf::from(path))
         .ok_or_else(|| format!("Unsafe path {path:?} in the version file"))
-}
-
-/// Whether a library's rules let this system (`osx`, `windows`, `linux`) use it: the last
-/// rule that matches decides.
-fn allowed(library: &Value, os: &str) -> bool {
-    let Some(rules) = library["rules"].as_array() else {
-        return true;
-    };
-    rules
-        .iter()
-        .rfind(|rule| rule["os"]["name"].as_str().is_none_or(|name| name == os))
-        .is_some_and(|rule| rule["action"] == "allow")
-}
-
-/// The classifier holding a library's natives for `os` (`natives-osx`), from its `natives` map;
-/// `${arch}` is this system's word size, as old versions name Windows' natives.
-pub(crate) fn native_classifier(library: &Value, os: &str) -> Option<String> {
-    let arch = if cfg!(target_pointer_width = "64") {
-        "64"
-    } else {
-        "32"
-    };
-    library["natives"][os]
-        .as_str()
-        .map(|key| key.replace("${arch}", arch))
-}
-
-/// The asset index's objects, once each.
-fn objects(index: &Value, dir: &Path) -> Result<Vec<File>, String> {
-    let objects = index["objects"]
-        .as_object()
-        .ok_or("The asset index has no objects")?;
-    let sizes: std::collections::HashMap<&str, u64> = objects
-        .values()
-        .filter_map(|o| Some((o["hash"].as_str()?, o["size"].as_u64()?)))
-        .collect();
-    let mut hashes: Vec<&str> = objects
-        .values()
-        .filter_map(|o| o["hash"].as_str())
-        .collect();
-    hashes.sort_unstable();
-    hashes.dedup();
-    hashes
-        .into_iter()
-        .map(|hash| {
-            if hash.len() != 40 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(format!("Bad asset hash {hash:?} in the asset index"));
-            }
-            let path = format!("{}/{hash}", &hash[..2]);
-            Ok(File {
-                url: format!("{OBJECTS}/{path}"),
-                sha1: hash.to_string(),
-                size: sizes.get(hash).copied(),
-                path: dir.join("assets/objects").join(path),
-            })
-        })
-        .collect()
 }
 
 /// One file from Mojang, refused unless it has the size and sha1 Mojang lists.
@@ -400,7 +238,3 @@ fn fetch_all(
     TOTAL.store(0, Relaxed);
     failed.into_inner().unwrap().map_or(Ok(()), Err)
 }
-
-#[cfg(test)]
-#[path = "mojang_tests.rs"]
-mod tests;

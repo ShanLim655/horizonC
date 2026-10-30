@@ -304,8 +304,8 @@ pub fn find(dir: &Path, pins: &Pins) -> Result<Found, String> {
 
 /// The error when no folder has the pinned version: every folder looked in with what it
 /// lacks, and what the player can do about it (#419, #693). When the chosen folder is inside a
-/// launcher Horizon knows, the advice names it: a Prism or MultiMC instance downloads the game
-/// only when it is launched once.
+/// launcher Horizon knows, the advice names it: a Prism or MultiMC instance populates its local game files
+/// when it is launched once.
 pub fn not_found(version: &str, checked: &[(PathBuf, String)], chosen: &Path) -> String {
     let mut text = format!("Minecraft {version} was not found. Horizon looked in:");
     for (dir, missing) in checked {
@@ -314,14 +314,14 @@ pub fn not_found(version: &str, checked: &[(PathBuf, String)], chosen: &Path) ->
     text += "\nTo fix it:";
     text += &match launcher_of(chosen) {
         Some(launcher) => format!(
-            "\n  • Launch the {version} instance once in {launcher} so it downloads the game, \
+            "\n  • Launch the {version} instance once in {launcher} so its files are present locally, \
              then prepare again.\n  \
              • Or choose the folder {launcher} keeps Minecraft {version} in (Minecraft folder › \
              Choose… in the launcher, --minecraft on the command line)."
         ),
         None => format!(
-            "\n  • Play {version} once in the official Minecraft launcher, or in Prism Launcher, \
-             MultiMC, the Modrinth App, ATLauncher or GDLauncher, then prepare again.\n  \
+            "\n  • Launch {version} once in the official Minecraft launcher, or in Prism Launcher, \
+             MultiMC, the Modrinth App, ATLauncher or GDLauncher, so its files are present locally, then prepare again.\n  \
              • Or choose the folder where your launcher keeps Minecraft {version} (Minecraft \
              folder › Choose… in the launcher, --minecraft on the command line)."
         ),

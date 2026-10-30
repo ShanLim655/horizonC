@@ -13,7 +13,6 @@ mod console;
 mod console_page;
 mod cull;
 mod datapacks_page;
-mod dev_options;
 mod export_page;
 mod game_tools;
 mod import_page;
@@ -28,7 +27,7 @@ mod modpacks_page;
 mod mods_page;
 mod mods_project;
 mod multiplayer_page;
-mod owner_page;
+mod disclaimer_page;
 mod packs_page;
 mod partner;
 mod perf;
@@ -50,7 +49,7 @@ use gpui::{
     FontWeight, Hsla, KeyBinding, KeyDownEvent, Menu, MenuItem, PathPromptOptions, SharedString,
     Stateful, Subscription, Window, WindowBounds, WindowOptions,
 };
-use horizon_launcher::account::{self, Accounts, SignIn, SignInState};
+use horizon_launcher::account::Accounts;
 use horizon_launcher::backend::{self, Job, Msg, Release, Running, Settings, Updates};
 use horizon_launcher::i18n::{self, tr, trf};
 use horizon_launcher::instances;
@@ -184,7 +183,7 @@ struct Launcher {
     picker_open: bool,
     /// The top bar's quick switch of who plays (`switch_page.rs`).
     account_menu: bool,
-    /// Settings > Account's skin panel for an offline name (`skin_page.rs`).
+    /// Settings > Offline profile skin panel (`skin_page.rs`).
     skin: Option<skin_page::SkinPanel>,
     /// Why the last picture for Home's background was refused.
     background_error: Option<String>,
@@ -207,21 +206,11 @@ struct Launcher {
     internet: internet::Internet,
     /// The window's own focus, so Tab reaches the controls when nothing else has the keyboard.
     root_focus: FocusHandle,
-    /// Microsoft accounts (accounts.json), the sign-in under way and what it last showed.
     accounts: Accounts,
-    sign_in: Option<SignIn>,
-    sign_in_state: Option<SignInState>,
-    keychain: bool,
-    /// Whether an account here owns the game, by the keychain's last answers (the owner gate);
-    /// none until the keychain has been read.
-    owner: Option<bool>,
-    /// Play was refused (or Home's Sign in pressed): the owner gate's screen is open.
-    owner_screen_open: bool,
-    /// Clicks on the sidebar's launcher version, and whether they revealed the developer options
-    /// (`dev_options`) for this run.
-    dev_clicks: u8,
-    dev_options: bool,
-    /// The game is waiting for its session (a token renewal) before it starts.
+    profile_error: Option<String>,
+    disclaimer_checked: bool,
+    disclaimer_open: bool,
+    /// The game is waiting for its local resources to finish before it starts.
     starting_client: Option<String>,
     /// Play was pressed on a version not prepared yet: it starts once this preparation ends well.
     play_when_prepared: Option<String>,
@@ -426,13 +415,9 @@ impl Launcher {
             internet: internet::Internet::new(),
             root_focus: cx.focus_handle(),
             accounts: Accounts::load(),
-            sign_in: None,
-            sign_in_state: None,
-            keychain: true,
-            owner: None,
-            owner_screen_open: false,
-            dev_clicks: 0,
-            dev_options: false,
+            profile_error: None,
+            disclaimer_checked: false,
+            disclaimer_open: false,
             starting_client: None,
             play_when_prepared: None,
             friend_code: String::new(),
@@ -484,14 +469,6 @@ impl Launcher {
             this.perf.keep_local_log(false);
         }
         let tx = this.tx.clone();
-        let keychain_tx = this.tx.clone();
-        // Asking the keychain can block (D-Bus), so not on this thread.
-        let accounts = this.accounts.clone();
-        std::thread::spawn(move || {
-            let store = account::store();
-            let _ = keychain_tx.send(Msg::Keychain(store.persistent()));
-            let _ = keychain_tx.send(Msg::Owner(accounts.has_owner(store)));
-        });
         std::thread::spawn(move || {
             let reused = backend::reuse_prepared_everywhere();
             if !reused.is_empty() {
@@ -674,35 +651,10 @@ impl Launcher {
                 Msg::Links(links) => self.links = links,
                 // The page reads is_prepared when drawn; `changed` redraws it.
                 Msg::Reused(_) => self.installed = backend::installed(),
-                Msg::Keychain(persistent) => self.keychain = persistent,
-                Msg::Owner(owns) => self.owner = Some(owns),
                 Msg::Playing(playing) => self.playing = playing,
-                Msg::Session(session) => {
+                Msg::Session => {
                     if let Some(tag) = self.starting_client.take() {
                         let mut cmd = backend::client_command(&tag);
-                        let (file, offline) = match session {
-                            Ok(pass) => pass,
-                            Err(account::NoOwner) => {
-                                self.owner = Some(false);
-                                self.owner_screen_open = true;
-                                self.client_error = Some(format!("{}.", tr(account::NEEDS_OWNER)));
-                                self.starting_pack = None;
-                                self.joining = None;
-                                self.quick_play = None;
-                                continue;
-                            }
-                        };
-                        // Past the gate by the developer option alone is no owner.
-                        if !self.settings.dev_offline {
-                            self.owner = Some(true);
-                        }
-                        if let Some(file) = file {
-                            cmd.arg("--session-file").arg(file);
-                        }
-                        // Still play, offline, and say why.
-                        if let Some(e) = offline {
-                            self.client_error = Some(format!("Playing offline: {e}"));
-                        }
                         self.accounts = Accounts::load();
                         // An offline name the player picked (the quick switch).
                         if let Some(name) = self.accounts.name_arg() {
@@ -952,26 +904,8 @@ impl Launcher {
         }
         changed |= self.servers_tick();
         changed |= self.mods_tick();
-        if let Some(sign_in) = &self.sign_in {
-            let state = sign_in.state();
-            let changed_state = format!("{state:?}") != format!("{:?}", self.sign_in_state);
-            if changed_state {
-                if let SignInState::Done(Ok(_)) = state {
-                    self.accounts = Accounts::load();
-                    // Sign-in refuses accounts that don't own the game.
-                    self.owner = Some(true);
-                    self.owner_screen_open = false;
-                    self.client_error = None;
-                    if !self.settings.owner_notice_seen {
-                        self.settings.owner_notice_seen = true;
-                        self.settings.save();
-                    }
-                }
-                self.sign_in_state = Some(state);
-                changed = true;
-            }
-        }
         if self
+            .checked        if self
             .checked
             .is_some_and(|at| at.elapsed() > backend::CHECK_EVERY)
         {
@@ -1059,8 +993,7 @@ impl Launcher {
         });
     }
 
-    /// Prepares the selected version, its Minecraft files from the player's install or, for an
-    /// owner who asks, from Mojang.
+    /// Prepares a version using local game files already on this computer.
     fn prepare(&mut self, from: backend::MinecraftFrom) {
         let Some(tag) = self.selected().cloned() else {
             return;
@@ -1076,12 +1009,12 @@ impl Launcher {
         self.prepare_log
             .push_back("Checking Java and your Minecraft install".into());
         let tx = self.tx.clone();
-        // The checks may download the server jar, so they run on the thread too.
+        let server_jar = self.settings.server_jar.clone();
         std::thread::spawn(move || {
             let log = |line| {
                 let _ = tx.send(Msg::Line(Job::Prepare, line));
             };
-            let result = backend::preparer(&tag, &minecraft, from, &log)
+            let result = backend::preparer(&tag, &minecraft, from, server_jar.as_deref(), &log)
                 .inspect(|(_, minecraft)| backend::sounds(&tag, minecraft, &log))
                 .and_then(|(p, _)| match p {
                     backend::Preparer::Process(cmd) => {
@@ -1129,35 +1062,48 @@ impl Launcher {
         self.selected().is_some_and(|tag| self.can_start(tag))
     }
 
-    /// Starts the game: the session first (a network round trip when the token needs
-    /// renewing), then `drain` starts the process when it arrives.
+    /// Completes local resources before the offline client process starts.
     fn start_client(&mut self, tag: String) {
+        if !self.settings.disclaimer_accepted {
+            self.disclaimer_open = true;
+            self.disclaimer_checked = false;
+            return;
+        }
         self.client_error = None;
         self.crash = None;
         self.prepare_log.clear();
         // A little earlier than the spawn: file times can be coarse.
         self.client_started =
             Some(std::time::SystemTime::now() - std::time::Duration::from_secs(2));
-        // What the resources lack (built-in packs, panorama, sounds) and the session (a network
-        // round trip when the token needs renewing) come first; `drain` starts the game when the
-        // session arrives.
+        // Complete optional local resources before starting the client.
         self.starting_client = Some(tag.clone());
         self.play_pressed = Some(Instant::now());
         let tx = self.tx.clone();
-        let offline_without_owner = self.settings.dev_offline;
         std::thread::spawn(move || {
             backend::complete_assets(&tag);
-            let session = account::session_for_game(&backend::game_home(), offline_without_owner);
-            let _ = tx.send(Msg::Session(session));
+            let _ = tx.send(Msg::Session);
         });
     }
 
-    /// Starts the Microsoft sign-in; Settings and the owner gate's screen show its code.
-    fn start_sign_in(&mut self) {
-        if let Some(old) = self.sign_in.replace(SignIn::start()) {
-            old.cancel();
-        }
-        self.sign_in_state = Some(SignInState::Starting);
+    fn choose_server_jar(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(mut paths))) = paths.await {
+                if let Some(path) = paths.pop() {
+                    let _ = this.update(cx, |this, cx| {
+                        this.settings.server_jar = Some(path);
+                        this.settings.save();
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     fn choose_folder(&mut self, cx: &mut Context<Self>) {
@@ -1518,20 +1464,17 @@ fn segments<T: Copy + PartialEq + 'static>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlayPress {
     Play,
-    /// Not prepared, for an account that owns the game: prepare it (from the player's install,
-    /// else downloaded from Mojang for that account), then play, as the official launcher does.
+    /// Not prepared: prepare the selected version from local files, then play.
     PrepareThenPlay,
-    /// Not prepared and no owner (signing in comes first), or busy preparing or playing.
+    /// Busy preparing or playing.
     Nothing,
 }
 
-/// `owner`: whether an account here owns the game, by the keychain (`Launcher::owner`).
-fn play_press(prepared: bool, owner: Option<bool>, busy: bool) -> PlayPress {
-    match (prepared, owner) {
-        _ if busy => PlayPress::Nothing,
-        (true, _) => PlayPress::Play,
-        (false, Some(true)) => PlayPress::PrepareThenPlay,
-        (false, _) => PlayPress::Nothing,
+fn play_press(prepared: bool, busy: bool) -> PlayPress {
+    match (prepared, busy) {
+        (_, true) => PlayPress::Nothing,
+        (true, false) => PlayPress::Play,
+        (false, false) => PlayPress::PrepareThenPlay,
     }
 }
 
@@ -1769,8 +1712,7 @@ impl Launcher {
                 }));
             nav = nav.child(keyboard(track_hover(item, id), &t));
         }
-        // Only a signed-in account says "Microsoft account"; otherwise an offline name, or the
-        // one the game made up.
+        // The local profile name shown in the top bar and switcher.
         let (name, how) = self.who_plays();
         let account = keyboard(div().id("account"), &t)
             .relative()
@@ -2121,7 +2063,6 @@ impl Launcher {
                 .pt(px(6.))
                 .text_color(t.muted)
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.version_clicked();
                     cx.notify();
                 })),
         );
@@ -2310,7 +2251,7 @@ impl Launcher {
                     .top(px(17.))
                     .child(blocks::icon("play", 22., t.on_face)),
             );
-        match play_press(prepared, self.owner, self.preparing || running) {
+        match play_press(prepared, self.preparing || running) {
             PlayPress::Nothing => play = disabled(play),
             PlayPress::Play => {
                 play = play.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -2349,37 +2290,18 @@ impl Launcher {
                     .child(play),
             );
 
-        // Not prepared: an owner can have Horizon download Minecraft from Mojang; without an
-        // owner there is nothing to play, so signing in comes first.
-        let first = (!prepared && !self.preparing)
-            .then_some(self.owner_shown())
-            .flatten();
-        // No launcher folder with Minecraft on this computer: an owner needs none.
-        let no_install = self.settings.minecraft_dir.is_none();
-        let resources_value = match first {
-            _ if self.preparing => tr("Preparing…").to_string(),
-            Some(true) if no_install => trf(
-                "Not prepared. Play downloads Minecraft {version} from Mojang for your account and prepares it.",
-                &[("version", &version)],
-            ),
-            Some(true) => trf(
-                "Not prepared. Horizon can download Minecraft {version} from Mojang for your account, or use your own install.",
-                &[("version", &version)],
-            ),
-            Some(false) => trf(
-                "Not prepared. Sign in with the Microsoft account that owns Minecraft {version} first.",
-                &[("version", &version)],
-            ),
-            None => backend::resources_summary(prepared, !silent, &version),
+        let resources_value = if self.preparing {
+            tr("Preparing…").to_string()
+        } else if prepared {
+            backend::resources_summary(true, !silent, &version)
+        } else {
+            tr("Not prepared. Select your existing Minecraft installation and import its files.")
+                .to_string()
         };
         let mut prepare = button(
             "prepare",
             if prepared { "Prepare again" } else { "Prepare" },
-            if prepared && !silent {
-                Kind::Ghost
-            } else {
-                Kind::Secondary
-            },
+            if prepared && !silent { Kind::Ghost } else { Kind::Secondary },
             &t,
         );
         if self.preparing {
@@ -2390,69 +2312,18 @@ impl Launcher {
                 cx.notify();
             }));
         }
-        let prepare = match first {
-            Some(true) if no_install => div().child(
-                button(
-                    "prepare-download",
-                    "Download and prepare",
-                    Kind::Secondary,
-                    &t,
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.prepare(backend::MinecraftFrom::Mojang);
-                    cx.notify();
-                })),
-            ),
-            Some(true) => div()
-                .flex()
-                .gap(px(8.))
-                .child(
-                    button("prepare-install", "From my install", Kind::Ghost, &t).on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.prepare(backend::MinecraftFrom::Install);
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .child(
-                    button(
-                        "prepare-download",
-                        "Download and prepare",
-                        Kind::Secondary,
-                        &t,
-                    )
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.prepare(backend::MinecraftFrom::Mojang);
-                        cx.notify();
-                    })),
-                ),
-            Some(false) => div().child(
-                button("prepare-sign-in", "Sign in", Kind::Secondary, &t).on_click(cx.listener(
-                    |this, _: &ClickEvent, _, cx| {
-                        this.sign_in_to_play();
-                        cx.notify();
-                    },
-                )),
-            ),
-            None => div().child(prepare),
-        };
-        let owner = self.owner == Some(true);
+        let prepare = div().child(prepare);
         let minecraft = self.settings.minecraft_dir.as_deref().map_or_else(
             || {
                 div()
-                    .child(if owner {
-                        tr("None needed: Horizon downloads Minecraft from Mojang for your account.")
-                    } else {
-                        tr("Not found. Choose the folder where your launcher keeps Minecraft.")
-                    })
+                    .child(tr("Not chosen. Select the folder where your launcher keeps Minecraft."))
                     .into_any_element()
             },
-            |p| {
-                div()
-                    .font_family(theme::MONO)
-                    .child(short(p))
-                    .into_any_element()
-            },
+            |p| div().font_family(theme::MONO).child(short(p)).into_any_element(),
+        );
+        let server_jar = self.settings.server_jar.as_deref().map_or_else(
+            || div().child(tr("Not imported. Select a server jar from your own installation.")).into_any_element(),
+            |p| div().font_family(theme::MONO).child(short(p)).into_any_element(),
         );
         let mut rows = div()
             .flex()
@@ -2478,50 +2349,21 @@ impl Launcher {
                         .into_any_element(),
                 ),
                 &t,
+            ))
+            .child(index_row(
+                4,
+                tr("Minecraft server jar"),
+                Some(server_jar),
+                Some(
+                    button("choose-server-jar", "Import…", Kind::Ghost, &t)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.choose_server_jar(cx)))
+                        .into_any_element(),
+                ),
+                &t,
             ));
-        {
-            rows = rows.child(self.join_friend_row(self.can_start(&tag), cx));
-            // The top bar shows who plays; a row only when there is something to do about it:
-            // no account that owns the game (Play needs one), or offline.
-            if self.owner_shown() == Some(false) {
-                rows = rows.child(index_row(
-                    5,
-                    tr("Microsoft account"),
-                    Some(
-                        div()
-                            .child(format!("{}.", tr(account::NEEDS_OWNER)))
-                            .into_any_element(),
-                    ),
-                    Some(
-                        button("gate-sign-in", "Sign in", Kind::Primary, &t)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.sign_in_to_play();
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                    ),
-                    &t,
-                ));
-            } else if self.accounts.selected().is_none() && account::client_id().is_some() {
-                rows = rows.child(index_row(
-                    5,
-                    tr("Playing offline"),
-                    Some(
-                        div()
-                            .child(tr("Online servers need a Microsoft account."))
-                            .into_any_element(),
-                    ),
-                    Some(
-                        button("accounts", "Accounts…", Kind::Ghost, &t)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.go(Page::Settings);
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                    ),
-                    &t,
-                ));
-            }
+        rows = rows.child(self.join_friend_row(self.can_start(&tag), cx));
+        if let Some(error) = &self.profile_error {
+            rows = rows.child(div().text_color(t.danger).child(error.clone()));
         }
 
         // The banner: Horizon's landscape (`art.rs`) under a veil of the page colour, the hero and
@@ -3018,8 +2860,7 @@ impl Launcher {
         };
         let mono = |s: String| div().font_family(theme::MONO).child(s).into_any_element();
         let plain = |s: &str| div().child(tr(s).to_string()).into_any_element();
-        let (accounts, n) = self.account_rows(cx);
-        let (offline, n) = self.offline_rows(n, cx);
+        let (offline, n) = self.offline_rows(0, cx);
         let appearance = segments(
             "appearance",
             &[
@@ -3051,16 +2892,31 @@ impl Launcher {
             .gap(px(32.))
             .child(page_header(
                 "Settings",
-                "Accounts, updates, and the launcher itself.",
+                "Offline profiles, updates, and the launcher itself.",
                 &t,
             ))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .child(group("Account", "user").mt_0())
-                    .child(accounts)
+                    .child(group("Offline profile", "user").mt_0())
                     .child(offline)
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(div().child(tr("Before You Play")).text_color(t.ink))
+                            .child(
+                                button("review-disclaimer", "Review…", Kind::Ghost, &t)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.disclaimer_open = true;
+                                        this.disclaimer_checked = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
                     .child(group("Updates", "reload"))
                     .child(index_row(
                         n + 1,
@@ -3162,7 +3018,6 @@ impl Launcher {
             )
             .child(self.collection_section(cx))
             .children(self.agents_section(cx))
-            .children(self.dev_options_section(cx))
     }
 
     /// Settings' Game arguments row: the extra arguments the game starts with, kept in
@@ -3412,176 +3267,6 @@ impl Launcher {
         self.settings.proxy = (!value.is_empty()).then_some(value);
         self.settings.save();
         horizon_launcher::proxy::announce(self.settings.proxy.clone());
-    }
-
-    /// Settings' Microsoft accounts: who is signed in and plays, the sign-in with its code. The
-    /// rows are numbered from 01; returns them and how many there are.
-    fn account_rows(&mut self, cx: &mut Context<Self>) -> (Div, usize) {
-        let t = self.theme;
-        let mut rows = div().flex().flex_col();
-        let mut n = 0;
-        let selected = self.accounts.selected.clone();
-        for (i, a) in self.accounts.accounts.clone().into_iter().enumerate() {
-            let plays = selected.as_ref() == Some(&a.uuid);
-            let uuid = a.uuid.clone();
-            let mut actions = div().flex().gap(px(4.));
-            if plays {
-                actions = actions.child(
-                    button(format!("offline-{i}"), "Play offline", Kind::Ghost, &t).on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            let mut accounts = Accounts::load();
-                            accounts.selected = None;
-                            if accounts.save().is_ok() {
-                                this.accounts = accounts;
-                            }
-                            cx.notify();
-                        }),
-                    ),
-                );
-            } else {
-                let uuid = uuid.clone();
-                actions = actions.child(
-                    button(format!("select-{i}"), "Play as", Kind::Secondary, &t).on_click(
-                        cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.play_as(account::Player::Microsoft(uuid.clone()));
-                            cx.notify();
-                        }),
-                    ),
-                );
-            }
-            actions = actions.child(
-                button(format!("sign-out-{i}"), "Sign out", Kind::Ghost, &t).on_click(cx.listener(
-                    move |this, _: &ClickEvent, _, cx| {
-                        let mut accounts = Accounts::load();
-                        match accounts
-                            .remove(account::store(), &uuid)
-                            .and_then(|()| accounts.save())
-                        {
-                            Ok(()) => this.accounts = accounts,
-                            Err(e) => this.sign_in_state = Some(SignInState::Done(Err(e))),
-                        }
-                        this.owner = Some(this.accounts.has_owner(account::store()));
-                        cx.notify();
-                    },
-                )),
-            );
-            n += 1;
-            rows = rows.child(index_row(
-                n,
-                a.name.clone(),
-                Some(
-                    div()
-                        .child(tr(if plays {
-                            "Microsoft account · plays"
-                        } else {
-                            "Microsoft account · signed in"
-                        }))
-                        .into_any_element(),
-                ),
-                Some(actions.into_any_element()),
-                &t,
-            ));
-        }
-        let configured = account::client_id().is_some();
-        let busy = matches!(
-            self.sign_in_state,
-            Some(SignInState::Starting | SignInState::Code(_))
-        );
-        let detail = match &self.sign_in_state {
-            _ if !configured => div().child(tr(account::NOT_CONFIGURED)),
-            Some(SignInState::Starting) => div().child(tr("Asking Microsoft…")),
-            Some(SignInState::Code(code)) => div()
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .child(trf(
-                    "Open {link} in your browser and enter this code:",
-                    &[("link", &code.verification_uri)],
-                ))
-                .child(
-                    text(theme::HEADING)
-                        .font_family(theme::MONO)
-                        .text_color(t.ink)
-                        .child(code.user_code.clone()),
-                ),
-            Some(SignInState::Done(Ok(a))) => div().child(format!("Signed in as {}.", a.name)),
-            Some(SignInState::Done(Err(e))) => div().text_color(t.danger).child(e.clone()),
-            None if self.accounts.accounts.is_empty() => div().child(tr(
-                "Horizon needs a Microsoft account that owns Minecraft: Java Edition, like other launchers. It also plays online servers with your name and skin.",
-            )),
-            None => div().child(tr("Add another account.")),
-        };
-        let detail = if self.keychain || self.accounts.accounts.is_empty() {
-            detail
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .child(detail)
-                .child(div().child(account::NO_KEYCHAIN))
-        };
-        let action = if !configured {
-            None
-        } else if let Some(SignInState::Code(code)) = &self.sign_in_state {
-            let (uri, user_code) = (code.verification_uri.clone(), code.user_code.clone());
-            Some(
-                div()
-                    .flex()
-                    .gap(px(4.))
-                    .child(
-                        button("sign-in-copy", "Copy code", Kind::Secondary, &t).on_click(
-                            move |_, _, cx| {
-                                copy_to_clipboard(
-                                    cx,
-                                    gpui::ClipboardItem::new_string(user_code.clone()),
-                                )
-                            },
-                        ),
-                    )
-                    .child(
-                        button("sign-in-open", "Open link", Kind::Secondary, &t)
-                            .on_click(move |_, _, cx| cx.open_url(&uri)),
-                    )
-                    .child(
-                        button("sign-in-cancel", "Cancel", Kind::Ghost, &t).on_click(cx.listener(
-                            |this, _: &ClickEvent, _, cx| {
-                                if let Some(s) = this.sign_in.take() {
-                                    s.cancel();
-                                }
-                                this.sign_in_state = None;
-                                cx.notify();
-                            },
-                        )),
-                    )
-                    .into_any_element(),
-            )
-        } else if busy {
-            None
-        } else {
-            Some(
-                button("sign-in", "Sign in with Microsoft", Kind::Secondary, &t)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.start_sign_in();
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            )
-        };
-        n += 1;
-        let title = if self.accounts.accounts.is_empty() {
-            "Microsoft account"
-        } else {
-            "Another account"
-        };
-        rows = rows.child(index_row(
-            n,
-            tr(title),
-            Some(detail.into_any_element()),
-            action,
-            &t,
-        ));
-        (rows, n)
     }
 
     /// Join a friend: a code field and Join, which starts the game straight
@@ -4232,8 +3917,8 @@ impl Render for Launcher {
         if self.asking_consent() {
             root = root.child(self.consent_screen(cx));
         }
-        if self.asking_owner() {
-            root = root.child(self.owner_screen(cx));
+        if self.asking_disclaimer() {
+            root = root.child(self.disclaimer_screen(cx));
         }
         if let Some(opening) = &self.opening {
             // The wordmark arrives letter by letter, then gives way to the launcher; a click or
@@ -4468,22 +4153,13 @@ mod tests {
         );
     }
 
-    /// An owner's Play works on a version not prepared yet: it prepares it (downloading
-    /// Minecraft from Mojang when this computer has no install), then plays. Without an owner
-    /// it stays off: signing in comes first.
     #[test]
-    fn play_prepares_first_for_an_owner() {
+    fn play_prepares_local_files_before_launch() {
         use super::{play_press, PlayPress};
-        assert_eq!(play_press(true, Some(true), false), PlayPress::Play);
-        assert_eq!(play_press(true, None, false), PlayPress::Play);
-        assert_eq!(
-            play_press(false, Some(true), false),
-            PlayPress::PrepareThenPlay
-        );
-        assert_eq!(play_press(false, Some(false), false), PlayPress::Nothing);
-        assert_eq!(play_press(false, None, false), PlayPress::Nothing);
-        assert_eq!(play_press(false, Some(true), true), PlayPress::Nothing);
-        assert_eq!(play_press(true, Some(true), true), PlayPress::Nothing);
+        assert_eq!(play_press(true, false), PlayPress::Play);
+        assert_eq!(play_press(false, false), PlayPress::PrepareThenPlay);
+        assert_eq!(play_press(false, true), PlayPress::Nothing);
+        assert_eq!(play_press(true, true), PlayPress::Nothing);
     }
 
     /// A server's Join (and every other shortcut) waits like Play: not while the version's

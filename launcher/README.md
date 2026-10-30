@@ -25,19 +25,7 @@ The opening, then Play ([clip](docs/opening.webm)):
   preparation reuses checksum-verified game jars and libraries from the current
   or another installed Horizon version, so the original Minecraft install is
   only required when no valid imported copy exists.
-- **Download and prepare**: for a signed-in account that owns the game (asked again first),
-  the launcher downloads the pinned version from Mojang itself (piston-meta, piston-data,
-  libraries.minecraft.net, resources.download.minecraft.net; never a mirror) into `minecraft/`
-  in its data folder, in the official launcher's layout: the version file, the client jar, this
-  system's libraries, the asset index and the assets. Every file must have the size and sha1
-  Mojang lists. The Play page shows how far it is and has Cancel; files already whole are kept,
-  so the next try goes on from there. **From my install** prepares from the player's own launcher
-  instead, and an install that lacks the version falls back to the download. **Play** on a version
-  not prepared yet does it all for an owner, as the official launcher does: it prepares from the
-  install when there is one, else downloads (with Mojang's Java when no Java 25 is installed), then
-  starts the game. With no install on the computer the Play page offers the download alone and the
-  Minecraft folder row says none is needed. Without an owner,
-  the Play page asks to sign in first. `horizon-launcher prepare --download`.
+- **Import and prepare**: preparation uses only Minecraft files already present in a legally obtained launcher installation. Choose the game folder and import a server jar from that same installation. Horizon does not download the Minecraft client, libraries, assets or server jar. Java may be found from an installed runtime or downloaded as a separate Java runtime when needed. Play prepares from the local files and then starts the game; missing files produce an import/setup error instead of an account prompt or game-file download.
 - **Mods**: search Modrinth (CurseForge support is coming soon) for resource
   packs and modpacks, each marked Works, Partly or Doesn't run in
   Horizon; Java mod jars are never offered. Install puts a pack and what it needs in
@@ -136,16 +124,14 @@ The opening, then Play ([clip](docs/opening.webm)):
   (`horizon_launcher::shortcut`). **Remove shortcut** moves it to the trash; it is found by the
   instance id inside it, so a rename doesn't lose it. `horizon-launcher instance shortcut
   [instance] [--remove]`; `HORIZON_LAUNCHER_DESKTOP` points it at another folder.
-- **Accounts and quick switch**: the top bar's account chip opens a menu of everyone who can play:
-  each signed-in Microsoft account, the offline names the player keeps, and the name the game
-  made up (`horizon-player.txt`). Picking one plays as it from the next Play. Offline names play
-  only while an account that owns the game is signed in ([Microsoft accounts](#microsoft-accounts));
-  signing the last one out keeps them, unplayable until one is back. Settings > Account
-  adds offline names (3 to 16 letters, digits or `_`; the game gets `--name`) and forgets them,
-  skin and cape files included, and rolls the game's made-up name for a new one; the Console's
-  Share log takes the names out of the log too. `horizon-launcher account offline
-  [NAME]`, `account select <name>` (an account or an offline name), `account forget-offline
-  <name>`.
+- **Offline profiles and quick switch**: the top bar's profile chip opens a menu of saved local
+  offline usernames and the name the game generates for itself (`horizon-player.txt`). Picking one
+  persists it for the next Play. Names must be 3 to 16 ASCII letters, digits or underscores.
+  Settings > Offline profile adds, selects and forgets local profiles; forgetting one also removes
+  its skin and cape files. Offline-mode servers and LAN may work. Authenticated online-mode servers
+  generally reject offline profiles. Commands: `horizon-launcher profile list`,
+  `profile offline [NAME]`, `profile select <name>`, `profile forget-offline <name>` and
+  `profile skin <name> [FILE]`.
 - **Accent and Home background**: on top of Dark, Light or System, Settings > Launcher picks an
   accent (Horizon's violet, blue, teal, green, amber, red or pink) and a picture of the player's
   own behind Home (PNG, JPEG or WebP, cropped to fill; **Landscape** brings Horizon's back). An
@@ -159,12 +145,12 @@ The opening, then Play ([clip](docs/opening.webm)):
   `launcher/lang/<code>.json`, English text to its translation, Horizon's own; a test fails when
   the code asks `tr("…")` for a string a table lacks, or a table keeps one the code dropped.
   `horizon-launcher settings language system|en|fr|ru`.
-- **Skin and cape**: each offline name's **Skin…** in Settings > Account shows the front of its
+- **Skin and cape**: each offline name's **Skin…** in Settings > Offline profile shows the front of its
   skin and cape, takes a skin PNG (64×64, or the older 64×32) and a cape PNG (64×32), and picks
   classic or slim arms. The launcher keeps copies in its `skins/` folder and gives the game
   `HORIZON_OFFLINE_SKIN`, `HORIZON_OFFLINE_SKIN_MODEL` and `HORIZON_OFFLINE_CAPE` when that name
   plays; the game draws the default skins until it reads them. A Microsoft account's skin and
-  cape: coming soon, with sign-in. `horizon-launcher account skin <name> [FILE] [--model
+  cape: coming soon, with sign-in. `horizon-launcher profile skin <name> [FILE] [--model
   classic|slim] [--cape FILE] [--no-skin] [--no-cape]`.
 - **Console**: Home's Console shows the game's output of this run as it comes: a search (every
   word, any case), Follow to keep the newest line in view, Copy, and Open logs folder. Warnings
@@ -306,11 +292,11 @@ and don't set `%ERRORLEVEL%` / `$LASTEXITCODE`. Scripts that need the exit code 
     horizon-launcher game-args [<line>]             show or set the extra arguments the game starts with
     horizon-launcher update [--check]               Horizon and the launcher
     horizon-launcher logs [--lines N] [--crash]     the end of the game's log, or its newest crash report
-    horizon-launcher account [list]                 the Microsoft accounts signed in (* = plays)
-    horizon-launcher account sign-in                sign in in your browser with a code
-    horizon-launcher account sign-out <name>
-    horizon-launcher account select <name>          play as this account
-    horizon-launcher account offline                play without an account
+    horizon-launcher profile [list]               local offline profiles (* = plays)
+    horizon-launcher profile select <name>        select a saved offline profile
+    horizon-launcher profile offline [name]       add/use a local name, or use the generated name
+    horizon-launcher profile forget-offline <name>
+    horizon-launcher profile skin <name> [FILE]   set a local profile's skin or cape
     horizon-launcher instance [list]                the instances and their game folders (* = Play starts it)
     horizon-launcher instance create <name> [--copy <instance>]   empty, or a copy of one's worlds, options and packs
     horizon-launcher instance create <name> --minecraft <1.21.4|latest|latest-snapshot>   a Minecraft: Java Edition instance
@@ -395,25 +381,11 @@ refuses. Every other command keeps working.
 
 The window, the command line and the MCP server all call the same core, `src/backend.rs`.
 
-## Microsoft accounts
+## Offline-only play
 
-The launcher starts the game only while a Microsoft account that owns Minecraft: Java Edition is
-signed in, as other launchers do: without one, Play (Home, instances, `horizon-launcher play`, the
-MCP's `play`) says "Sign in with a Microsoft account that owns Minecraft: Java Edition to play"
-and starts nothing. Settings → Accounts signs in: the launcher shows a code, you enter it at
-microsoft.com/link, and the launcher checks that the account owns the game. It asks again at every
-Play, with the token renewal; with no network the last answer stands, and a "doesn't own" blocks
-at once. The account also plays online-mode servers under your own name and skin; offline names
-play LAN and offline-mode servers beside it. The game binary started directly (`horizon-client`,
-`horizon-ctl launch`), the harnesses and the servers don't go through this check. Tokens live in the system keychain (Keychain,
-Credential Manager, or the Secret Service on Linux), never in a file, a log or the command line;
-`accounts.json` in the data folder keeps only names and UUIDs. Without a keychain you stay signed
-in until the launcher closes. When the game starts, it gets the session in a private file it
-deletes as soon as it has read it. Sign out removes the tokens.
+Horizon C has no Microsoft/Xbox sign-in, account linking or token storage. It starts the client with a local offline profile and uses only imported game files from a legally obtained Minecraft installation. Offline-mode servers and LAN play may work; authenticated online-mode servers generally require an official authenticated account and will reject offline profiles. Horizon C does not provide a Minecraft license.
 
-Sign-in needs Horizon's own Azure app registration: its client ID is built in from
-`HORIZON_MSA_CLIENT_ID` (and `HORIZON_MSA_CLIENT_ID` at run time overrides it; empty = not
-configured). How it works: [docs/microsoft-account.md](../docs/microsoft-account.md).
+The **Before You Play** notice is shown before first use and remains available from Settings.
 
 ## Logs and crash reports
 
