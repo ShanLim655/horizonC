@@ -1,7 +1,7 @@
 //! Everything that is not UI: GitHub, installs, resource preparation, the game's processes and
 //! updates. The GUI, the CLI and the MCP server all go through this module. Functions here
 //! block; the GUI runs them on threads and reads their messages.
-use crate::{account, mojang, sources};
+use crate::{mojang, sources};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1261,97 +1261,6 @@ fn preparer_binary(dir: &Path) -> Option<PathBuf> {
     binary.is_file().then_some(binary)
 }
 
-/// Downloads the pinned version from Mojang into `dir` when an account in the launcher owns
-/// Minecraft (asked again now), else says what signing in would do, as the last line of the
-/// not-found error.
-fn download_for_owner(
-    pins: &sources::Pins,
-    dir: &Path,
-    fetch: sources::Fetch,
-    log: &dyn Fn(String),
-) -> Result<(), String> {
-    let mut accounts = account::Accounts::load();
-    // The strict gate, never `launch_for_game`: the developer option that lets offline names
-    // play without an owner must not download the game for them.
-    let pass = account::launch(
-        &account::Endpoints::live(),
-        account::client_id().as_deref(),
-        account::store(),
-        &mut accounts,
-    );
-    let _ = accounts.save();
-    download_for(pins, dir, pass, !accounts.accounts.is_empty(), fetch, log)
-}
-
-/// Downloads Minecraft `id` (any version on Mojang's list, its version file's sha1 from it) into
-/// Horizon's own game folder, in the official launcher's layout, for an account that owns the
-/// game (asked again now). Returns that folder.
-pub fn download_version_for_owner(
-    id: &str,
-    manifest_sha1: &str,
-    log: &dyn Fn(String),
-) -> Result<PathBuf, String> {
-    let dir = data_dir().join("minecraft");
-    let fetch = |url: &str| -> Result<Vec<u8>, String> {
-        let mut body = Vec::new();
-        get(url)?
-            .into_reader()
-            .read_to_end(&mut body)
-            .map_err(|e| e.to_string())?;
-        Ok(body)
-    };
-    let pins = sources::Pins::for_version(id, manifest_sha1);
-    download_for_owner(&pins, &dir, &fetch, log)
-        .map_err(|e| e.trim_start_matches("\n  • ").to_string())?;
-    Ok(dir)
-}
-
-/// What [`download_for_owner`] does with the owner gate's answer: Mojang's files only for its
-/// `owner`, an account the services said owns the game just now.
-fn download_for(
-    pins: &sources::Pins,
-    dir: &Path,
-    pass: Result<account::Launch, account::NoOwner>,
-    signed_in: bool,
-    fetch: sources::Fetch,
-    log: &dyn Fn(String),
-) -> Result<(), String> {
-    let v = &pins.version;
-    match pass {
-        Ok(account::Launch {
-            owner: Some((owner, _)),
-            ..
-        }) => {
-            let name = owner.name;
-            log(format!(
-                "{name} owns Minecraft: downloading {v} from Mojang"
-            ));
-            let os = match sources::Os::current() {
-                sources::Os::Linux => "linux",
-                sources::Os::MacOs => "osx",
-                sources::Os::Windows => "windows",
-            };
-            mojang::download(pins, dir, os, 8, fetch, &mojang::CANCEL, log).map_err(|e| {
-                format!("\n  • Horizon tried to download {v} from Mojang for {name}, but: {e}")
-            })
-        }
-        // An owner by its last answer, who can't be asked now.
-        Ok(pass) => Err(format!(
-            "\n  • Downloading {v} from Mojang needs your Microsoft account, which could not be \
-             checked: {}",
-            pass.offline.unwrap_or_default()
-        )),
-        Err(_) if signed_in => Err(
-            "\n  • No signed-in account owns Minecraft: Java Edition, so Horizon can't download it."
-                .into(),
-        ),
-        Err(_) => Err(format!(
-            "\n  • Or sign in with the Microsoft account that owns Minecraft: Horizon then \
-             downloads {v} from Mojang itself."
-        )),
-    }
-}
-
 /// The Java home for this version: a runtime for precompiled exporters, a JDK for older
 /// preparers or changed sources. Forward the selection to external preparers too.
 /// Else try the official launcher's Java in `games`, then download the runtime named by
@@ -1459,11 +1368,7 @@ fn assets_folder(
 /// Where the preparation takes Minecraft's files from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MinecraftFrom {
-    /// The player's own install (any launcher's); Mojang only when none has the version and an
-    /// account that owns the game is signed in.
     Install,
-    /// Mojang, for the signed-in account that owns the game ("Download and prepare").
-    Mojang,
 }
 
 /// Checks what the preparation needs and picks how to run it. PLAY.txt describes the same
@@ -1474,20 +1379,20 @@ pub enum MinecraftFrom {
 pub fn preparer(
     tag: &str,
     minecraft: &Path,
-    from: MinecraftFrom,
+    _from: MinecraftFrom,
+    server_jar: Option<&Path>,
     log: &dyn Fn(String),
 ) -> Result<(Preparer, PathBuf), String> {
     let version = game_version(tag);
     let dir = version_dir(tag);
     let reused = horizon_prepare::artifacts::reuse_imported(&dir, &|line| log(line.to_string()))?;
     let chosen = minecraft.to_path_buf();
-    // Resolved even when the game files are reused: the assets still come from the install.
     let minecraft = {
         let pins = read_json(&dir.join("research-lock.json"))
             .and_then(|lock| sources::Pins::read(&lock))
             .ok_or("The version's research-lock.json doesn't pin the Minecraft files")?;
         let own = data_dir().join("minecraft");
-        let mut known = vec![("Horizon's own download", own.clone())];
+        let mut known = vec![("Horizon's local game folder", own.clone())];
         known.extend(
             sources::Folders::current()
                 .map(|f| sources::known_folders(sources::Os::current(), &f))
@@ -1502,23 +1407,14 @@ pub fn preparer(
             Ok(body)
         };
         let linked = data_dir().join("linked-minecraft");
-        if from == MinecraftFrom::Mojang {
-            // Straight from Mojang (what is already there and whole is kept), for an owner only.
-            download_for_owner(&pins, &own, &fetch, log)
-                .map_err(|e| e.trim_start_matches("\n  • ").to_string())?;
-            own
+        let resolved = sources::resolve(minecraft, &pins, &known, &linked, &fetch, log);
+        if reused {
+            assets_folder(resolved, &chosen, &version, log)
         } else {
-            let resolved = sources::resolve(minecraft, &pins, &known, &linked, &fetch, log);
-            if reused {
-                assets_folder(resolved, &chosen, &version, log)
-            } else {
-                match resolved? {
-                    sources::Resolved::Folder(dir) => dir,
-                    sources::Resolved::NotFound(checked) => {
-                        let not_found = sources::not_found(&version, &checked, minecraft);
-                        download_for_owner(&pins, &own, &fetch, log).map_err(|e| not_found + &e)?;
-                        own
-                    }
+            match resolved? {
+                sources::Resolved::Folder(dir) => dir,
+                sources::Resolved::NotFound(checked) => {
+                    return Err(sources::not_found(&version, &checked, minecraft));
                 }
             }
         }
@@ -1534,9 +1430,6 @@ pub fn preparer(
             "This version prepares with Python: Python 3.10 or newer is needed. Install it, or pick a newer version.",
         )?),
     };
-    // The Java the version pins, found as horizon-prepare finds it, so a missing one is
-    // reported (or downloaded) before the server jar is downloaded. Versions from before
-    // java_major ran Java 25.
     let major = read_json(&dir.join("research-lock.json"))
         .and_then(|lock| lock["minecraft"]["java_major"].as_i64())
         .unwrap_or(25);
@@ -1558,24 +1451,19 @@ pub fn preparer(
     let jar = data_dir()
         .join("server-jars")
         .join(format!("{version}.jar"));
-    if !reused && !jar.exists() {
-        let json: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&manifest).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
-        let url = json["downloads"]["server"]["url"]
-            .as_str()
-            .ok_or_else(|| format!("{} has no server download", manifest.display()))?;
-        log(format!("Downloading the {version} server jar from Mojang"));
+    if !reused && !jar.is_file() {
+        let source = server_jar.ok_or_else(|| {
+            format!(
+                "No local Minecraft {version} server jar was supplied. Import a server jar from your legally obtained installation with --server-jar PATH. Horizon does not download Minecraft game files."
+            )
+        })?;
+        if !source.is_file() {
+            return Err(format!("The server jar does not exist: {}", source.display()));
+        }
         fs::create_dir_all(jar.parent().unwrap()).map_err(|e| e.to_string())?;
-        let mut body = Vec::new();
-        get(url)?
-            .into_reader()
-            .read_to_end(&mut body)
-            .map_err(|e| e.to_string())?;
-        let partial = jar.with_extension("partial");
-        fs::write(&partial, body)
-            .and_then(|_| fs::rename(&partial, &jar))
-            .map_err(|e| e.to_string())?;
+        fs::copy(source, &jar)
+            .map_err(|e| format!("Could not import the local Minecraft server jar: {e}"))?;
+        log(format!("Imported the local Minecraft {version} server jar"));
     }
     if let Some(binary) = binary {
         if horizon_prepare::sources_sha256(&dir.join(PREPARER_CRATE)).as_deref()
@@ -1608,53 +1496,6 @@ pub fn preparer(
     }
     cmd.arg("--minecraft-dir").arg(&minecraft);
     Ok((Preparer::Process(cmd), minecraft))
-}
-
-/// Copies the pinned version's sounds from the player's own launcher install into the version's
-/// resources (`horizon-prepare sounds`), each line to `log`. Sound is optional, so a launcher
-/// install without them is a line in the log, never a failed preparation. The version's own
-/// preparer does it when it is not the launcher's and knows how; versions from before it read
-/// the sounds where the launcher's preparer puts them.
-pub fn sounds(tag: &str, minecraft: &Path, log: &dyn Fn(String)) {
-    let dir = version_dir(tag);
-    let own = horizon_prepare::sources_sha256(&dir.join(PREPARER_CRATE)).as_deref()
-        == Some(horizon_prepare::SOURCES_SHA256);
-    let binary = preparer_binary(&dir).filter(|binary| {
-        !own && crate::process::command(binary)
-            .arg("--help")
-            .output()
-            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("horizon-prepare sounds"))
-    });
-    log("Copying the sounds from your Minecraft install".into());
-    let result = match binary {
-        Some(binary) => crate::process::command(binary)
-            .current_dir(&dir)
-            .arg("sounds")
-            .arg("--root")
-            .arg(&dir)
-            .arg("--minecraft-dir")
-            .arg(minecraft)
-            .output()
-            .map_err(|e| e.to_string())
-            .and_then(|o| {
-                let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
-                for line in text(&o.stdout).lines() {
-                    log(line.to_string());
-                }
-                match o.status.success() {
-                    true => Ok(()),
-                    false => Err(text(&o.stderr).trim_start_matches("error: ").to_string()),
-                }
-            }),
-        None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            horizon_prepare::sounds(&dir, Some(minecraft), &|line| log(line.to_string()))
-        }))
-        .unwrap_or_else(|_| Err("The sound copy stopped unexpectedly".into()))
-        .map(|_| ()),
-    };
-    if let Err(e) = result {
-        log(format!("No sound (the game will be silent): {e}"));
-    }
 }
 
 /// Runs `Preparer::InProcess` on this thread, each progress line to `log`. A panic is an
@@ -2075,29 +1916,32 @@ pub fn need_prepared(tag: &str) -> Result<(), String> {
     } else {
         Err(format!(
             "{tag} is not prepared yet. Prepare it first: `horizon-launcher prepare --version {tag}` \
-             uses your own Minecraft {v}, or downloads it from Mojang for the signed-in account \
-             that owns it.",
+             uses your own legally obtained Minecraft {v} installation.",
             v = game_version(tag)
         ))
     }
 }
 
-/// The client's command, once the owner gate lets it start and its resources are prepared. Past
-/// the gate, a sign-in that can't be renewed (no network, expired) still lets the game start,
-/// offline.
+/// The client's command, always using the selected local offline profile.
+fn disclaimer_guard(settings: &Settings) -> Result<(), String> {
+    if settings.disclaimer_accepted {
+        Ok(())
+    } else {
+        Err("Open Horizon C and accept the Before You Play notice before launching.".into())
+    }
+}
+
 pub fn client(tag: &str) -> Result<Command, String> {
-    let (session, offline) = account::session_for_game(&game_home(), false)
-        .map_err(|refused| format!("{refused} Sign in with `horizon-launcher account sign-in`."))?;
+    disclaimer_guard(&Settings::load())?;
     need_prepared(tag)?;
     complete_assets(tag);
     crate::browser::horizon::before_play(&game_home());
     let mut cmd = client_command(tag);
-    if let Some(file) = session {
-        cmd.arg("--session-file").arg(file);
+    let profiles = crate::account::Accounts::load();
+    if let Some(name) = profiles.name_arg() {
+        cmd.arg("--name").arg(name);
     }
-    if let Some(e) = offline {
-        eprintln!("Playing offline: {e}");
-    }
+    cmd.envs(profiles.look_env());
     append_game_args(&mut cmd);
     Ok(cmd)
 }
@@ -2659,13 +2503,7 @@ pub enum Msg {
     LauncherUpdated(Result<(), String>),
     /// `reuse_prepared_everywhere` prepared these versions.
     Reused(Vec<(String, String)>),
-    /// Whether secrets are kept in the OS keychain (else only until the launcher closes).
-    Keychain(bool),
-    /// Whether an account in the launcher owned the game at its last check (the owner gate).
-    Owner(bool),
-    /// The owner gate's answer for the game about to start: the selected account's session
-    /// file (none = offline) and why it plays offline, if it does.
-    Session(Result<(Option<PathBuf>, Option<String>), crate::account::NoOwner>),
+    Session,
     /// A modpack step's line (`modpacks`).
     PackLine(String),
     /// A modpack step ended: the pack as it now is.
@@ -2841,10 +2679,8 @@ pub struct Settings {
     /// first-run question, or on the Play page once if they answered that before it existed.
     #[serde(default)]
     pub ping_notice_seen: bool,
-    /// The player without an account that owns the game has read, once, why the launcher needs
-    /// one now (the owner gate's screen).
     #[serde(default)]
-    pub owner_notice_seen: bool,
+    pub disclaimer_accepted: bool,
     /// Seconds the sidebar's partner banner has been on screen, over every start, up to
     /// `partner::SEEN_BEFORE_HIDE`: only then can the player hide it.
     #[serde(default)]
@@ -2869,12 +2705,8 @@ pub struct Settings {
     /// a game of their own. Off by default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub native_mods: bool,
-    /// Developer options (hidden: seven clicks on the sidebar's launcher version reveal them):
-    /// offline names play without an account that owns the game, in the window only
-    /// (`account::Accounts::play_as_with`, `account::launch_for_game`). Never a download: the game still
-    /// comes from the player's own install. Off by default, and absent from the file while off.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub dev_offline: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_jar: Option<PathBuf>,
 }
 
 impl Settings {
@@ -2973,105 +2805,50 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The launcher downloads Mojang's game files (client jar, libraries, assets) only for an
-    /// account the services said owns the game: never without one, and never past the gate by
-    /// the developer option (`Settings::dev_offline`), whose pass has no owner.
     #[test]
-    fn mojang_downloads_only_for_an_owner() {
-        let dir = std::env::temp_dir().join(format!("horizon-owner-only-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let pins = sources::Pins::read(&serde_json::json!({ "minecraft": {
-            "version": "26.3",
-            "client_sha1": "00",
-            "manifest_sha1": "00",
-        }}))
-        .unwrap();
-        let asked = std::sync::Mutex::new(Vec::<String>::new());
-        let fetch = |url: &str| -> Result<Vec<u8>, String> {
-            asked.lock().unwrap().push(url.to_string());
-            Err("no network in tests".into())
-        };
-        let log = |_: String| {};
-        let no_owner = || Ok(account::Launch::default());
-        for (pass, signed_in) in [
-            (Err(account::NoOwner), false),
-            (Err(account::NoOwner), true),
-            (no_owner(), false),
-            (no_owner(), true),
-        ] {
-            assert!(download_for(&pins, &dir, pass, signed_in, &fetch, &log).is_err());
-        }
-        assert!(asked.lock().unwrap().is_empty());
-        assert!(!dir.exists());
-        // An owner: Mojang is asked (and the download fails here, without network).
-        let owner = account::Account {
-            uuid: "069a79f444e94726a5befca90e38aaf5".into(),
-            name: "Notch".into(),
-            skin: None,
-            cape: None,
-        };
-        let secrets = serde_json::from_str(
-            r#"{"refresh_token":"r","minecraft_token":"t","minecraft_expires_at":1,"owns":true}"#,
-        )
-        .unwrap();
-        let pass = Ok(account::Launch {
-            owner: Some((owner, secrets)),
-            ..Default::default()
-        });
-        assert!(download_for(&pins, &dir, pass, true, &fetch, &log).is_err());
-        assert!(!asked.lock().unwrap().is_empty());
-        let _ = fs::remove_dir_all(&dir);
+    fn production_backend_has_no_mojang_game_download_or_account_session_path() {
+        let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend.rs"))
+            .unwrap();
+        let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+        assert!(!production.contains("mojang::download("));
+        assert!(!production.contains("session_for_game("));
+        assert!(!production.contains("download_for_owner("));
+    }
 
-        // In the sources: one call downloads the game, in `download_for`, and the only caller
-        // of that asks the strict gate. Game-file hosts appear nowhere else.
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = vec![src.clone()];
-        let mut sources = Vec::new();
-        while let Some(path) = files.pop() {
-            if path.is_dir() {
-                files.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let name = path.file_name().unwrap().to_string_lossy().to_string();
-                let in_tests = name.contains("tests") || path.parent().unwrap() != src;
-                // The code alone: test modules (this one included) come after it.
-                // A Windows checkout has CRLF line ends: the searches below look for "\n".
-                let mut text = fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
-                text.truncate(text.find("#[cfg(test)]").unwrap_or(text.len()));
-                sources.push((name, in_tests, text));
+    #[test]
+    fn launcher_sources_have_no_microsoft_or_xbox_auth_endpoints() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for file in ["account.rs", "backend.rs", "main.rs", "cli.rs", "mcp.rs", "switch_page.rs"] {
+            let source = fs::read_to_string(root.join(file)).unwrap();
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            for endpoint in [
+                "login.microsoftonline.com",
+                "user.auth.xboxlive.com",
+                "xsts.auth.xboxlive.com",
+                "api.minecraftservices.com",
+                "HORIZON_MSA_CLIENT_ID",
+            ] {
+                assert!(!production.contains(endpoint), "{file} still contains {endpoint}");
             }
         }
-        let calls: Vec<_> = sources
-            .iter()
-            .filter(|(_, tests, _)| !tests)
-            .flat_map(|(name, _, text)| {
-                text.matches("mojang::download(")
-                    .map(move |_| name.as_str())
-            })
-            .collect();
-        assert_eq!(calls, ["backend.rs"]);
-        let backend = &sources.iter().find(|(n, ..)| n == "backend.rs").unwrap().2;
-        let body = |f: &str| {
-            let start = backend.find(&format!("\nfn {f}(")).unwrap();
-            &backend[start..start + backend[start + 1..].find("\n}\n").unwrap()]
-        };
-        assert!(body("download_for").contains("mojang::download("));
-        assert!(body("download_for_owner").contains("account::launch("));
-        assert!(!body("download_for_owner").contains("launch_for_game("));
-        // `download_for` is defined once and called once, by `download_for_owner`.
-        assert_eq!(backend.matches("download_for(").count(), 2);
-        assert!(body("download_for_owner").contains("download_for("));
-        for host in [
-            "piston-data",
-            "libraries.minecraft.net",
-            "resources.download.minecraft.net",
-        ] {
-            for (name, tests, text) in &sources {
-                assert!(
-                    *tests || name == "mojang.rs" || !text.contains(host),
-                    "{name} names {host}"
-                );
-            }
-        }
+    }
+
+    #[test]
+    fn the_client_cannot_launch_before_the_disclaimer_is_accepted() {
+        let mut settings = Settings::default();
+        assert!(disclaimer_guard(&settings).is_err());
+        settings.disclaimer_accepted = true;
+        assert!(disclaimer_guard(&settings).is_ok());
+    }
+
+    #[test]
+    fn disclaimer_acceptance_is_persisted_in_settings() {
+        let mut settings = Settings::default();
+        assert!(!settings.disclaimer_accepted);
+        settings.disclaimer_accepted = true;
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(Settings::parse(&saved).disclaimer_accepted);
+        assert!(!Settings::parse("{}").disclaimer_accepted);
     }
 
     /// A preparation that reuses the imported game files still reads the assets from the

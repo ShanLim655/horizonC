@@ -1,7 +1,7 @@
 //! `horizon-launcher <subcommand>`: the same steps as the window, from a terminal. Every
 //! command goes through `backend`; this file only parses arguments and prints.
 use clap::{Parser, Subcommand};
-use horizon_launcher::account::{self, Accounts};
+use horizon_launcher::account::{Accounts, Player};
 use horizon_launcher::backend::{self, Release};
 use horizon_launcher::instances;
 use horizon_launcher::server_list;
@@ -95,41 +95,25 @@ enum ServersCmd {
 }
 
 #[derive(Subcommand)]
-enum AccountCmd {
-    /// The signed-in accounts and which one plays
+enum ProfileCmd {
+    /// List the local offline profiles and the one currently selected
     List,
-    /// Sign in with a Microsoft account in your browser (device code). Play needs one that owns
-    /// Minecraft: Java Edition
-    SignIn,
-    /// Sign out: the account's tokens leave the keychain
-    SignOut {
-        /// Its name or UUID
-        who: String,
-    },
-    /// Play as this account, or as one of your offline names
+    /// Select a saved offline profile by name
     Select { who: String },
-    /// Play offline (LAN, offline-mode servers) beside a signed-in account that owns the game:
-    /// as NAME (kept to switch back to; 3 to 16 letters, digits or _), or as the name the game
-    /// made up
+    /// Play as a saved offline name, or the game's generated name when NAME is omitted
     Offline { name: Option<String> },
-    /// Forget one of your offline names; its skin and cape go with it
+    /// Forget one of the local offline profiles; its skin and cape go with it
     ForgetOffline { name: String },
-    /// Show or set an offline name's skin and cape: a 64x64 (or 64x32) skin PNG, a 64x32 cape
-    /// PNG, the model. Kept by the launcher and given to the game when that name plays
+    /// Show or set a profile's skin and cape
     Skin {
         name: String,
-        /// The skin's PNG
         file: Option<PathBuf>,
-        /// classic or slim arms
         #[arg(long)]
         model: Option<String>,
-        /// The cape's PNG
         #[arg(long)]
         cape: Option<PathBuf>,
-        /// Back to the default skin
         #[arg(long)]
         no_skin: bool,
-        /// Take the cape off
         #[arg(long)]
         no_cape: bool,
     },
@@ -596,21 +580,19 @@ enum Cmd {
     Install { tag: String },
     /// Remove an installed version
     Remove { tag: String },
-    /// Prepare a version's resources from your own Minecraft install, or from Mojang
+    /// Prepare a version from game files already present in a legally obtained installation
     Prepare {
-        /// The game folder of the official launcher, Prism Launcher, MultiMC, the Modrinth App,
-        /// ATLauncher or GDLauncher (default: the launcher's, then every launcher's default)
-        #[arg(long, conflicts_with = "download")]
-        minecraft: Option<PathBuf>,
-        /// Download Minecraft from Mojang for the signed-in account that owns it, instead of
-        /// using an install
+        /// The game folder of an existing Minecraft launcher installation
         #[arg(long)]
-        download: bool,
+        minecraft: Option<PathBuf>,
+        /// A server jar from your legally obtained Minecraft installation
+        #[arg(long)]
+        server_jar: Option<PathBuf>,
         /// The installed version (default: the selected one)
         #[arg(long)]
         version: Option<String>,
     },
-    /// Start the client (needs a signed-in Microsoft account that owns Minecraft: Java Edition)
+    /// Start the client under the selected local offline profile using imported game files
     Play {
         #[arg(long)]
         version: Option<String>,
@@ -668,10 +650,10 @@ enum Cmd {
     Notes { tag: Option<String> },
     /// Show the Discord, sponsor and website links
     Links,
-    /// Microsoft accounts: list them (the default), sign in, sign out, or pick the one that plays
-    Account {
+    /// Local offline profiles: list, select, add, remove and manage profile skins
+    Profile {
         #[command(subcommand)]
-        action: Option<AccountCmd>,
+        action: Option<ProfileCmd>,
     },
     /// Show the launcher's settings, or set one (the Settings page): selected-version TAG,
     /// minecraft-dir PATH, server-dir PATH ("default" resets a folder), install-new-versions
@@ -1106,18 +1088,18 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
         }
         Cmd::Prepare {
             minecraft,
-            download,
+            server_jar,
             version,
         } => {
             let tag = backend::resolve_version(version.as_deref())?;
             let minecraft = backend::minecraft_dir(minecraft)?;
-            let from = if download {
-                backend::MinecraftFrom::Mojang
-            } else {
-                backend::MinecraftFrom::Install
-            };
-            let (preparer, minecraft) =
-                backend::preparer(&tag, &minecraft, from, &|line| eprintln!("{line}"))?;
+            let (preparer, minecraft) = backend::preparer(
+                &tag,
+                &minecraft,
+                backend::MinecraftFrom::Install,
+                server_jar.as_deref(),
+                &|line| eprintln!("{line}"),
+            )?;
             backend::sounds(&tag, &minecraft, &|line| println!("{line}"));
             match preparer {
                 backend::Preparer::Process(cmd) => attached(cmd)?,
@@ -1158,11 +1140,6 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
             }
             cmd.args(arg);
             let started = std::time::Instant::now();
-            let accounts = Accounts::load();
-            if let Some(name) = accounts.name_arg() {
-                cmd.arg("--name").arg(name);
-            }
-            cmd.envs(accounts.look_env());
             let played = attached(horizon_launcher::launch::wrap(cmd, &instance.launch));
             if let Err(e) = instances::record_play(&instance.id, started.elapsed()) {
                 eprintln!("Play time not saved: {e}");
@@ -1195,7 +1172,7 @@ fn execute(command: Cmd, as_json: bool) -> Result<(), String> {
                 );
             }
         }
-        Cmd::Account { action } => account_command(action.unwrap_or(AccountCmd::List), as_json)?,
+        Cmd::Profile { action } => profile_command(action.unwrap_or(ProfileCmd::List), as_json)?,
         Cmd::Benchmark { repeats } => {
             let path = crate::perf::benchmark(repeats.max(1))?;
             if as_json {
@@ -1518,112 +1495,46 @@ fn update(check: bool, as_json: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// `account …`: names and UUIDs only; tokens are never printed.
-fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
-    let mut accounts = Accounts::load();
-    let find = |accounts: &Accounts, who: &str| {
-        accounts
-            .find(who)
-            .cloned()
-            .ok_or_else(|| format!("No signed-in account {who}. See `horizon-launcher account`."))
-    };
+/// The local profiles selected by the player; no online account is used or stored.
+fn profile_command(action: ProfileCmd, as_json: bool) -> Result<(), String> {
+    let mut profiles = Accounts::load();
     match action {
-        AccountCmd::List => {
+        ProfileCmd::List => {
             if as_json {
                 json(serde_json::json!({
-                    "accounts": accounts.accounts.iter().map(|a| serde_json::json!({
-                        "name": a.name, "uuid": a.uuid,
-                        "selected": accounts.selected.as_ref() == Some(&a.uuid),
+                    "profiles": profiles.offline.iter().map(|name| serde_json::json!({
+                        "name": name,
+                        "selected": profiles.name_arg().is_some_and(|selected| selected == name),
                     })).collect::<Vec<_>>(),
-                    "offline": accounts.offline.iter().map(|n| serde_json::json!({
-                        "name": n,
-                        "selected": accounts.player() == account::Player::Offline(n.clone()),
-                    })).collect::<Vec<_>>(),
-                    "sign_in_configured": account::client_id().is_some(),
-                    "owner": accounts.has_owner(account::store()),
+                    "plays_as": profiles.name_arg(),
                 }));
-            } else if accounts.accounts.is_empty() && accounts.offline.is_empty() {
-                println!(
-                    "No Microsoft account signed in. Play needs one that owns Minecraft: Java \
-                     Edition: horizon-launcher account sign-in"
-                );
+            } else if profiles.offline.is_empty() {
+                println!("No saved offline profiles. Add one with `horizon-launcher profile offline NAME`.");
             } else {
-                for a in &accounts.accounts {
-                    let mark = if accounts.selected.as_ref() == Some(&a.uuid) {
-                        "*"
-                    } else {
-                        " "
-                    };
-                    println!("{mark} {}  {}", a.name, a.uuid);
+                for name in &profiles.offline {
+                    let selected = profiles.name_arg().is_some_and(|current| current == name);
+                    println!("{} {name}", if selected { "*" } else { " " });
                 }
-                for n in &accounts.offline {
-                    let on = accounts.player() == account::Player::Offline(n.clone());
-                    println!("{} {n}  offline", if on { "*" } else { " " });
-                }
-                if accounts.player() == account::Player::GameName {
-                    println!(
-                        "Playing offline as the game's own name (`account select NAME` to switch)."
-                    );
-                }
-                if !accounts.has_owner(account::store()) {
-                    println!("{}.", account::NEEDS_OWNER);
+                if profiles.name_arg().is_none() {
+                    println!("Playing as the game's generated offline name.");
                 }
             }
         }
-        AccountCmd::SignIn => {
-            let client_id = account::client_id().ok_or(account::NOT_CONFIGURED)?;
-            let ep = account::Endpoints::live();
-            let code = account::device_code(&ep, &client_id)?;
-            eprintln!(
-                "To sign in, open {} in a browser and enter the code {}",
-                code.verification_uri, code.user_code
-            );
-            let ms = account::wait_for_sign_in(&ep, &client_id, &code, &|| false)?;
-            let (signed_in, secrets) = account::finish_sign_in(&ep, ms)?;
-            accounts.add(account::store(), signed_in.clone(), &secrets)?;
-            accounts.save()?;
-            println!("Signed in as {}.", signed_in.name);
-            if !account::store().persistent() {
-                eprintln!("{}", account::NO_KEYCHAIN);
+        ProfileCmd::Select { who } => {
+            profiles.play_as(Player::Offline(who.clone()))?;
+            profiles.save()?;
+            println!("The game plays offline as {who}.");
+        }
+        ProfileCmd::Offline { name } => {
+            let player = name.map_or(Player::GameName, Player::Offline);
+            profiles.play_as(player)?;
+            profiles.save()?;
+            match profiles.name_arg() {
+                Some(name) => println!("The game plays offline as {name}."),
+                None => println!("The game plays offline as the name it generates."),
             }
         }
-        AccountCmd::SignOut { who } => {
-            let a = find(&accounts, &who)?;
-            accounts.remove(account::store(), &a.uuid)?;
-            accounts.save()?;
-            println!("Signed out {}.", a.name);
-        }
-        AccountCmd::Select { who } => {
-            let offline = accounts
-                .offline
-                .iter()
-                .find(|n| n.eq_ignore_ascii_case(&who))
-                .cloned();
-            let (player, name) = match (accounts.find(&who).cloned(), offline) {
-                (Some(a), _) => (account::Player::Microsoft(a.uuid), a.name),
-                (None, Some(n)) => (
-                    account::Player::Offline(n.clone()),
-                    format!("{n} (offline)"),
-                ),
-                (None, None) => return Err(find(&accounts, &who).unwrap_err()),
-            };
-            accounts.play_as(account::store(), player)?;
-            accounts.save()?;
-            println!("The game plays as {name}.");
-        }
-        AccountCmd::Offline { name } => {
-            let player = match name {
-                Some(n) => account::Player::Offline(n),
-                None => account::Player::GameName,
-            };
-            accounts.play_as(account::store(), player)?;
-            accounts.save()?;
-            match accounts.name_arg() {
-                Some(n) => println!("The game plays offline as {n}."),
-                None => println!("The game plays offline, as the name it made up."),
-            }
-        }
-        AccountCmd::Skin {
+        ProfileCmd::Skin {
             name,
             file,
             model,
@@ -1632,21 +1543,19 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
             no_cape,
         } => {
             use horizon_launcher::skins::{self, Model};
-            let name = accounts
+            let name = profiles
                 .offline
                 .iter()
-                .find(|n| n.eq_ignore_ascii_case(&name))
+                .find(|saved| saved.eq_ignore_ascii_case(&name))
                 .cloned()
-                .ok_or_else(|| {
-                    format!("No offline name {name}: add it with `account offline {name}`.")
-                })?;
+                .ok_or_else(|| format!("No offline profile named {name}."))?;
             let model = match model.as_deref() {
                 None => None,
                 Some("classic") => Some(Model::Classic),
                 Some("slim") => Some(Model::Slim),
-                Some(m) => return Err(format!("{m}: say classic or slim")),
+                Some(other) => return Err(format!("{other}: say classic or slim")),
             };
-            let mut look = accounts.look(&name);
+            let mut look = profiles.look(&name);
             if let Some(file) = &file {
                 skins::keep(&skins::dir(), &name, file, false)?;
                 look.skin = true;
@@ -1655,15 +1564,13 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                 skins::keep(&skins::dir(), &name, file, true)?;
                 look.cape = true;
             }
-            if let Some(m) = model {
-                look.model = m;
+            if let Some(model) = model {
+                look.model = model;
             }
             look.skin &= !no_skin;
             look.cape &= !no_cape;
-            accounts
-                .looks
-                .insert(name.to_ascii_lowercase(), look.clone());
-            accounts.save()?;
+            profiles.looks.insert(name.to_ascii_lowercase(), look.clone());
+            profiles.save()?;
             if as_json {
                 json(serde_json::json!({
                     "name": name, "skin": look.skin, "cape": look.cape, "model": look.model.name(),
@@ -1678,10 +1585,10 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                 );
             }
         }
-        AccountCmd::ForgetOffline { name } => {
-            accounts.remove_offline(&name, &horizon_launcher::skins::dir())?;
-            accounts.save()?;
-            println!("Forgot the offline name {name}.");
+        ProfileCmd::ForgetOffline { name } => {
+            profiles.remove_offline(&name, &horizon_launcher::skins::dir())?;
+            profiles.save()?;
+            println!("Forgot the offline profile {name}.");
         }
     }
     Ok(())
